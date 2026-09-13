@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+// Prevent duplicate simultaneous AI analyses for the same ticket.
+const activeAnalyses = new Set();
+
 dotenv.config({ path: path.join(__dirname, '.env') });
 import express from 'express';
 import cors from 'cors';
@@ -210,9 +213,6 @@ app.post('/api/tickets', async (req, res) => {
       created_at: data.created_at,
     });
 
-    // Automation is intentionally non-blocking.
-    await triggerAutomation({ event: 'ticket.created', ticket: data });
-
     return res.status(201).json(data);
   } catch (error) {
     console.error('POST /api/tickets', error);
@@ -332,27 +332,34 @@ app.put('/api/tickets/:ticket_id', async (req, res) => {
   }
 });
 
-app.post('/api/tickets/:ticket_id/analyze', async (req, res) => {
-  try {
-    if (!requireDb(res)) return;
 
-    const ticketId = cleanText(req.params.ticket_id);
-    const ticket = await getFullTicket(ticketId);
-    if (!ticket) return res.status(404).json({ error: 'Ticket not found.' });
+async function getTicketById(ticketId) {
+  const { data, error } = await supabase
+    .from('tickets')
+    .select('*')
+    .eq('ticket_id', ticketId)
+    .maybeSingle();
 
-    const { data: comparableTickets, error: comparableError } = await supabase
-      .from('tickets')
-      .select('id,ticket_id,customer_name,customer_email,subject,description,status,created_at,updated_at')
-      .neq('ticket_id', ticketId)
-      .order('created_at', { ascending: false })
-      .limit(50);
+  if (error) throw error;
+  return data || null;
+}
 
-    if (comparableError) throw comparableError;
+async function listTicketRecords() {
+  const { data, error } = await supabase
+    .from('tickets')
+    .select(
+      'id,ticket_id,customer_name,customer_email,subject,description,status,created_at,updated_at'
+    )
+    .order('created_at', { ascending: false });
 
-    const insights = await aiAnalyze(ticket, comparableTickets || []);
-    const generatedAt = insights.generated_at;
+  if (error) throw error;
+  return data || [];
+}
 
-    const { error: insertError } = await supabase.from('ai_insights').insert({
+async function saveAIInsights(ticketId, insights) {
+  const { error } = await supabase
+    .from('ai_insights')
+    .insert({
       ticket_id: ticketId,
       category: insights.category,
       priority: insights.priority,
@@ -362,32 +369,156 @@ app.post('/api/tickets/:ticket_id/analyze', async (req, res) => {
       summary: insights.summary,
       suggested_action: insights.suggested_action,
       suggested_reply: insights.suggested_reply,
-      resolution_plan: insights.resolution_plan,
+      resolution_plan: insights.resolution_plan || [],
       customer_impact: insights.customer_impact,
-      risk_factors: insights.risk_factors,
-      data_signals: insights.data_signals,
-      similar_ticket_ids: insights.similar_ticket_ids,
+      risk_factors: insights.risk_factors || [],
+      data_signals: insights.data_signals || [],
+      similar_ticket_ids: insights.similar_ticket_ids || [],
       explanation: insights.explanation,
-      generated_at: generatedAt,
+      generated_at: insights.generated_at || new Date().toISOString(),
     });
 
-    if (insertError) throw insertError;
+  if (error) throw error;
+}
 
-    const { error: eventError } = await supabase.from('ticket_events').insert({
+async function addTicketEvent(ticketId, eventType, message) {
+  const { error } = await supabase
+    .from('ticket_events')
+    .insert({
       ticket_id: ticketId,
-      event_type: 'ai_analyzed',
-      message: `AI decision brief updated · ${insights.category} · ${insights.priority}`,
-      created_at: generatedAt,
+      event_type: eventType,
+      message,
+      created_at: new Date().toISOString(),
     });
-    if (eventError) throw eventError;
 
-    return res.json(insights);
-  } catch (error) {
-    console.error('POST /api/tickets/:ticket_id/analyze', error);
-    return res.status(500).json({ error: 'AI analysis failed.' });
+  if (error) throw error;
+}
+
+app.post(
+  '/api/tickets/:ticket_id/analyze',
+  async (req, res) => {
+    const ticketId =
+      cleanText(req.params.ticket_id);
+
+    if (!ticketId) {
+      return res.status(400).json({
+        error: 'Ticket ID is required.',
+      });
+    }
+
+    /*
+     * Prevent duplicate simultaneous analysis
+     * for the same ticket.
+     */
+    if (activeAnalyses.has(ticketId)) {
+      return res.status(409).json({
+        error:
+          'This ticket is already being analyzed. Please wait for the current analysis to finish.',
+        ticket_id: ticketId,
+        processing: true,
+      });
+    }
+
+    activeAnalyses.add(ticketId);
+
+    console.log(
+      `[AI] Analysis lock acquired | ticket=${ticketId}`
+    );
+
+    try {
+      /*
+       * Load the ticket from the database.
+       */
+      const ticket =
+        await getTicketById(ticketId);
+
+      if (!ticket) {
+        return res.status(404).json({
+          error: 'Ticket not found.',
+          ticket_id: ticketId,
+        });
+      }
+
+      /*
+       * Load comparison tickets so the AI can
+       * identify recurring problems.
+       */
+      const comparableTickets =
+        await listTicketRecords();
+
+      /*
+       * Run the real AI pipeline.
+       *
+       * aiAnalyze() already handles:
+       * OpenRouter → validation → fallback.
+       */
+      const insights =
+        await aiAnalyze(
+          ticket,
+          comparableTickets.filter(
+            (item) =>
+              item.ticket_id !==
+              ticketId
+          )
+        );
+
+      /*
+       * Persist AI decision brief.
+       */
+      await saveAIInsights(
+        ticketId,
+        insights
+      );
+
+      /*
+       * Record the AI operation in the
+       * immutable ticket timeline.
+       */
+      await addTicketEvent(
+        ticketId,
+        'ai_analyzed',
+        `AI decision brief updated · ${insights.category} · ${insights.priority}`
+      );
+
+      console.log(
+        `[AI] Analysis completed | ticket=${ticketId}`
+      );
+
+      return res.json(
+        insights
+      );
+    } catch (error) {
+      console.error(
+        `[AI] Analysis request failed | ticket=${ticketId}`,
+        error
+      );
+
+      /*
+       * Never expose internal stack traces,
+       * API keys, provider responses or database
+       * implementation details to the browser.
+       */
+      return res.status(500).json({
+        error:
+          'The ticket could not be analyzed right now. Please try again.',
+        ticket_id: ticketId,
+      });
+    } finally {
+      /*
+       * GUARANTEED CLEANUP.
+       *
+       * Whether analysis succeeds, falls back,
+       * or throws an error, the ticket must be
+       * unlocked.
+       */
+      activeAnalyses.delete(ticketId);
+
+      console.log(
+        `[AI] Analysis lock released | ticket=${ticketId}`
+      );
+    }
   }
-});
-
+);
 async function aiAnalyze(
   ticket,
   comparableTickets = []
@@ -737,27 +868,26 @@ Return exactly this structure:
   /*
    * Normalize common model formatting.
    */
-  let jsonText = raw;
-
-  if (
-    jsonText.startsWith('```')
-  ) {
-    jsonText =
-      jsonText
-        .replace(
-          /^```(?:json)?\s*/i,
-          ''
-        )
-        .replace(
-          /\s*```$/i,
-          ''
-        )
-        .trim();
-  }
+  let jsonText = raw.trim();
 
   /*
-   * Extract JSON object if the model added
-   * harmless surrounding text.
+   * Remove Markdown fences when a free model wraps
+   * the JSON response in ```json ... ```.
+   */
+  jsonText = jsonText
+    .replace(
+      /^```(?:json)?\s*/i,
+      ''
+    )
+    .replace(
+      /\s*```$/i,
+      ''
+    )
+    .trim();
+
+  /*
+   * Always extract the outermost JSON object.
+   * This handles leading/trailing commentary.
    */
   const firstBrace =
     jsonText.indexOf('{');
@@ -766,30 +896,63 @@ Return exactly this structure:
     jsonText.lastIndexOf('}');
 
   if (
-    firstBrace > 0 &&
-    lastBrace > firstBrace
+    firstBrace === -1 ||
+    lastBrace === -1 ||
+    lastBrace <= firstBrace
   ) {
-    jsonText =
-      jsonText.slice(
-        firstBrace,
-        lastBrace + 1
-      );
+    console.warn(
+      '[AI] OpenRouter response contained no complete JSON object.'
+    );
+
+    throw new Error(
+      'OpenRouter did not return a complete JSON object.'
+    );
   }
+
+  jsonText =
+    jsonText.slice(
+      firstBrace,
+      lastBrace + 1
+    ).trim();
 
   let parsed;
 
   try {
     parsed =
       JSON.parse(jsonText);
-  } catch {
-    console.warn(
-      '[AI] OpenRouter raw response:',
-      raw.slice(0, 1200)
-    );
+  } catch (firstError) {
+    /*
+     * Second attempt: repair trailing commas and
+     * remove invalid control characters.
+     */
+    const repairedJson =
+      jsonText
+        .replace(
+          /,\s*([}\]])/g,
+          '$1'
+        )
+        .replace(
+          /[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g,
+          ''
+        );
 
-    throw new Error(
-      'OpenRouter returned invalid JSON.'
-    );
+    try {
+      parsed =
+        JSON.parse(repairedJson);
+
+      console.warn(
+        `[AI] OpenRouter JSON required minor repair | ticket=${ticket.ticket_id}`
+      );
+    } catch {
+      console.warn(
+        '[AI] OpenRouter raw response:',
+        raw
+      );
+
+      throw new Error(
+        'OpenRouter returned invalid JSON.'
+      );
+    }
   }
 
   const categoryValues = [
@@ -1186,20 +1349,6 @@ function actionFor(category, priority) {
   };
 
   return prefix + actions[category];
-}
-
-async function triggerAutomation(payload) {
-  if (!process.env.N8N_WEBHOOK_URL) return;
-  try {
-    const response = await fetch(process.env.N8N_WEBHOOK_URL, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!response.ok) console.warn(`n8n webhook returned ${response.status}`);
-  } catch (error) {
-    console.warn('n8n automation skipped:', error.message);
-  }
 }
 
 app.use((error, _req, res, _next) => {
