@@ -22,17 +22,70 @@ const supabase = process.env.SUPABASE_URL && supabaseKey
     })
   : null;
 
-const allowedOrigins = String(process.env.FRONTEND_ORIGIN || 'http://localhost:5173')
-  .split(',')
-  .map((value) => value.trim())
-  .filter(Boolean);
+const allowedOrigins = [
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'https://datastraw-support-intelligence-crm.vercel.app',
+];
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error('Origin not allowed by CORS'));
-  },
-}));
+const configuredFrontendUrl = String(
+  process.env.FRONTEND_URL || ''
+)
+  .trim()
+  .replace(/\/$/, '');
+
+if (
+  configuredFrontendUrl &&
+  !allowedOrigins.includes(configuredFrontendUrl)
+) {
+  allowedOrigins.push(configuredFrontendUrl);
+}
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      // Allow requests without Origin headers
+      // from PowerShell, curl, server-to-server calls, etc.
+      if (!origin) {
+        return callback(null, true);
+      }
+
+      const normalizedOrigin = origin
+        .trim()
+        .replace(/\/$/, '');
+
+      if (
+        allowedOrigins.includes(normalizedOrigin)
+      ) {
+        return callback(null, true);
+      }
+
+      console.warn(
+        `[CORS] Blocked origin: ${origin}`
+      );
+
+      return callback(
+        new Error('Origin not allowed by CORS')
+      );
+    },
+
+    methods: [
+      'GET',
+      'POST',
+      'PUT',
+      'DELETE',
+      'OPTIONS',
+    ],
+
+    allowedHeaders: [
+      'Accept',
+      'Content-Type',
+      'Authorization',
+    ],
+
+    optionsSuccessStatus: 204,
+  })
+);
 app.use(express.json({ limit: '1mb' }));
 
 const STATUS_VALUES = ['Open', 'In Progress', 'Closed'];
