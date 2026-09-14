@@ -1356,6 +1356,10 @@ app.use((error, _req, res, _next) => {
   res.status(500).json({ error: 'Unexpected server error.' });
 });
 
-app.listen(port, () => {
-  console.log(`Datastraw CRM API listening on :${port}`);
+const PORT = Number(process.env.PORT) || 8080;
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(
+    `Datastraw CRM API listening on :${PORT}`
+  );
 });
